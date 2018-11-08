@@ -1,36 +1,38 @@
 package main
 import (
 	"crypto/rsa"
-	"crypto/sha1"
+	"crypto/sha256"
 	"math/rand"
-	rand2 "crypto/rand"
 	"math/big"
-	"fmt"
 	"time"
 )
 
 type ring struct {
-	K []*rsa.PrivateKey
-	L uint
-	N int
-	Q *big.Int
-	P *big.Int
+	PubKeys []*rsa.PublicKey
+	PriKey	*rsa.PrivateKey
+	L       uint				//rsa 密钥长度
+	N       int					//组成员个数
+	Q       *big.Int			//与密钥长度相对应的随机数阈值
+	P       *big.Int			//作为对称加密key的hash结果
 }
 
-func (this *ring) init(k []*rsa.PrivateKey, L uint) {
-	this.K = make([]*rsa.PrivateKey, 0, len(k))
-	this.K = append(this.K, k...)
+//L是rsa密钥长度
+func (this *ring) init(pubkeys []*rsa.PublicKey,prikey *rsa.PrivateKey, L uint) {
+	this.PubKeys = make([]*rsa.PublicKey, 0, len(pubkeys))
+	this.PubKeys = append(this.PubKeys, pubkeys...)
+	this.PriKey = prikey
 	this.L = L
-	this.N = len(k)
+	this.N = len(pubkeys)
 	this.Q = big.NewInt(1)
 	this.Q.Lsh(this.Q, L)
 	this.P = big.NewInt(0)
 }
 
+//m是消息，z是密钥对应的公钥在环成员的位置，从0开始
 func (this *ring) sign(m string, z int) []*big.Int{
-	this.permut(m)
-	s := make([]*big.Int, this.N, this.N)
-	e := big.NewInt(0)
+	this.hash(m)
+	//xs保存的是所有x的值
+	xs := make([]*big.Int, this.N, this.N)
 	temp := big.NewInt(0)
 	c := big.NewInt(0)
 	v := big.NewInt(0)
@@ -38,70 +40,71 @@ func (this *ring) sign(m string, z int) []*big.Int{
 
 	var rand1 *rand.Rand
 	rand1 = rand.New(rand.NewSource(time.Now().Unix()))
-	//应该是要保存的参数
+	//pick random v, c=eEk(u), u = myY xor v
 	u.Set(temp.Rand(rand1, this.Q))
-	v.Set(this.E(u))
+	v.Set(this.eEk(u))
 	c.Set(v)
+
+	//loop 得到签名成员之后的成员顺序
 	var loop []int
 	for i:=int(0); i < this.N; i++ {
 		loop = append(loop, i)
 	}
 	loop = append(loop, loop...)
 	loop = loop[z+1:z+this.N]
+	//随机选取E
 	for _,i := range loop {
-		s[i] = big.NewInt(0)
-		s[i].Set(temp.Rand(rand1, this.Q))
-		temp.SetInt64(int64(this.K[i].E))
-		e = this.g(s[i], temp, this.K[i].N)
-		//fmt.Println(e)
-		v = this.E(v.Xor(v,e))
+		xs[i] = big.NewInt(0)
+		xs[i].Set(temp.Rand(rand1, this.Q))
+		temp.SetInt64(int64(this.PubKeys[i].E))
+		yi := this.g(xs[i], temp, this.PubKeys[i].N)
+		v = this.eEk(v.Xor(v,yi))
 		if (i + 1) % this.N == 0 {
 			c.Set(v)
 		}
 	}
-	s[z] = big.NewInt(0)
-	s[z].Set(this.g(temp.Xor(v, u), this.K[z].D, this.K[z].N))
+
+	//cal myX from myY
+	xs[z] = big.NewInt(0)
+	xs[z].Set(this.g(temp.Xor(v, u), this.PriKey.D, this.PriKey.N))
+	//re为最后一名成员得到的v
 	re := []*big.Int{c}
-	//fmt.Println(s)
-	return append(re, s[:]...)
+	return append(re, xs[:]...)
 }
 
 func (this *ring) verify(m string, X []*big.Int) int{
 	var y []*big.Int
 	r := big.NewInt(0)
 	temp := big.NewInt(0)
-	this.permut(m)
+	this.hash(m)
 	//生成所有yi
 	for i:=0; i < len(X)-1; i++ {
-		temp = big.NewInt(int64(this.K[i].E))
-		y = append(y, this.g(X[i+1], temp, this.K[i].N))
-		//fmt.Println(this.g(X[i+1], temp, this.K[i].N))
+		temp = big.NewInt(int64(this.PubKeys[i].E))
+		y = append(y, this.g(X[i+1], temp, this.PubKeys[i].N))
 	}
-	//一轮过后是否相同，Ckv（y1...yn）=E(yn xor E(yn-1 xor ... E(y1 xor v)...)) = v
+	//一轮过后是否相同，Ckv（y1...yn）=eEk(yn xor eEk(yn-1 xor ... eEk(y1 xor v)...)) = v
 	r.Set(X[0])
 	for i:=0; i < this.N; i++ {
-		r = this.E(temp.Xor(r, y[i]))
+		r = this.eEk(temp.Xor(r, y[i]))
 	}
-	//fmt.Println(r)
-	//fmt.Println(X[0])
 	return r.Cmp(X[0])
 }
 
-//求出明文的hash放入P中作为k
-func (this *ring) permut(m string) {
-	a := sha1.Sum([]byte(m))
+//求出明文的hash放入P中作为k，更新成sha256
+func (this *ring) hash(m string) {
+	a := sha256.Sum256([]byte(m))
 	this.P.SetBytes(a[:])
 }
 
-//生成随机数+原本明文hash的hash
-func (this *ring) E(x *big.Int) *big.Int {
+//对称加密函数，在这里使用单向hash
+func (this *ring) eEk(x *big.Int) *big.Int {
 	msg := x.String() + this.P.String()
 	re := big.NewInt(0)
-	a := sha1.Sum([]byte(msg))
+	a := sha256.Sum256([]byte(msg))
 	return re.SetBytes(a[:])
 }
 
-//g的函数，针对传入的e不同功能不同
+//g的函数，针对传入的e不同功能不同，实现限门函数作用，但不引入随机数
 func (this *ring) g(x *big.Int,e *big.Int,n *big.Int) *big.Int{
 	temp1 := big.NewInt(0)
 	temp2 := big.NewInt(0)
@@ -126,38 +129,15 @@ func (this *ring) g(x *big.Int,e *big.Int,n *big.Int) *big.Int{
 	return rslt
 }
 
-
-func main() {
-	size := 4
-	msg1, msg2 := "hello", "world!"
-	var key []*rsa.PrivateKey
+func SignWrapper(size int, num int, msg string, key []*rsa.PublicKey, mySecret *rsa.PrivateKey) []*big.Int{
 	r := new(ring)
-	for i := 0; i<size; i++{
-		new,_ := rsa.GenerateKey(rand2.Reader, 1024)
-		key = append(key, new)
-	}
-	r.init(key, 1024)
-
-	for i := 0; i<size; i++{
-		s1 := r.sign(msg1, i)
-		s2 := r.sign(msg2, i)
-		fmt.Print(i, ":: ")
-		fmt.Print(r.verify(msg1, s1), " ")
-		fmt.Print(r.verify(msg2, s2), " ")
-		fmt.Print(r.verify(msg2, s1))
-		fmt.Println()
-	}
-}
-
-func Sign_Wrapper(size int, num int, msg string, key []*rsa.PrivateKey) []*big.Int{
-	r := new(ring)
-	r.init(key, 1024)
+	r.init(key, mySecret,1024)
 	return r.sign(msg, num)
 }
 
-func Verify_Wrapper(msg string, key []*rsa.PrivateKey, X []*big.Int) bool {
+func VerifyWrapper(msg string, key []*rsa.PublicKey, X []*big.Int) bool {
 	r := new(ring)
-	r.init(key, 1024)
+	r.init(key,nil, 1024)
 	re := r.verify(msg, X)
 	if re == 0 {
 		return true
